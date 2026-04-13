@@ -54,26 +54,67 @@ Kernel driver in use: yt6801
 
 ## Recovery script
 
+### Prerequisites
+
+- **Bash** (script uses `mapfile`, process substitution, and strict mode).
+- **NetworkManager** (`nmcli` must work for your user when using `sudo`).
+- **ethtool** (to read the driver name for the chosen interface).
+- **sudo** privileges for `ip link`, `modprobe`, and (typically) `nmcli connection up`.
+
 Make it executable:
 
 ```bash
 chmod +x ethernet-link-recover.sh
 ```
 
-Run it:
+Run it (no arguments — the Ethernet interface is auto-detected):
 
 ```bash
-./ethernet-link-recover.sh enp44s0
+sudo ./ethernet-link-recover.sh
 ```
 
-## What the script does
+### What the script does (execution order)
 
-The script attempts to recover the wired link without rebooting the machine:
+The script runs a fixed pipeline. Steps below match the implementation in `ethernet-link-recover.sh`.
 
-1. unloads the `yt6801` kernel module
-2. loads it again
-3. asks NetworkManager to reconnect the interface
-4. prints the resulting link state
+1. **Detect the Ethernet interface** (`detect_iface`):
+   - Lists devices NetworkManager reports as type `ethernet`.
+   - If there is exactly one, that name is used.
+   - If there are several, prefers the interface whose `ethtool -i` driver is **`yt6801`**.
+   - Otherwise prefers an Ethernet device NM marks as connected, connecting, disconnected, or unavailable.
+   - If it still cannot pick one interface safely, the script exits with an error.
+
+2. **Read the kernel driver name** for that interface (`detect_driver` via `ethtool -i`). This may be empty on unusual systems; driver reload is skipped when empty.
+
+3. **Resolve the NetworkManager connection UUID** (`find_or_create_profile_uuid`), in order:
+   - **Active on this NIC:** `nmcli -g GENERAL.CON-UUID device show <iface>`, but only if the profile passes the sanity checks in step 4.
+   - **Else** first matching row in `nmcli connection show --active` where `TYPE` is `ethernet` or `802-3-ethernet` and `DEVICE` equals `<iface>`, again only if step 4 passes.
+   - **Else** scan all saved connections by UUID: `802-3-ethernet`, `connection.interface-name` equals `<iface>`, not a bridge/slave (no `connection.master` / `connection.slave-type`). Prefer a profile whose **`connection.id` equals the interface name** (e.g. `enp44s0`); otherwise use the first such match.
+   - **Else** create **`autorecover-<iface>`**: DHCP, autoconnect, bound to `<iface>`, and use its UUID.
+
+4. **Profile sanity checks** (standalone wired profile, used for active/device UUID and consistent with the saved scan):
+   - `connection.type` is `802-3-ethernet`.
+   - `connection.interface-name` is empty, `--`, or equals `<iface>` (so NM does not try to apply the profile to the wrong netdev).
+   - `connection.slave-type` and `connection.master` are unset or `--` (skips Docker/bridge port profiles that break a plain `connection up`).
+
+5. **Log** interface name, driver, `connection.id`, and UUID for the chosen profile; log **carrier** from `/sys/class/net/<iface>/carrier` before any recovery.
+
+6. **Soft link reset** (`soft_recover`): `ip link set <iface> down`, sleep 1s, `ip link set <iface> up`.
+
+7. **Wait for carrier** (up to **10** seconds): polls `carrier`; only then proceeds to activation so NM does not fail with “no carrier” immediately after the flap.
+
+8. **Bring the profile up** (`bring_up_profile`): `nmcli connection up uuid <UUID> ifname <iface>` (UUID disambiguates profiles; `ifname` pins the device), then sleep 2s. Failures are non-fatal (`|| true`) so you still get the final status dump.
+
+9. **If carrier never returned in step 7:** unload the driver (`modprobe -r <driver>`), reload (`modprobe <driver>`), run **soft reset** again, wait up to **15** seconds for carrier, then repeat step 8 if carrier appeared; otherwise log that carrier is still absent.
+
+10. **Print diagnostics:** `nmcli device status`, `ip link show <iface>`, and the final `carrier` value.
+
+### Design notes (why it looks this way)
+
+- **UUID, not name:** `connection.id` / connection names are not guaranteed unique in NetworkManager. Activation uses **`nmcli connection up uuid …`** so the correct object is selected.
+- **`ifname` on `connection up`:** without it, NM can associate the profile with the wrong device (e.g. a bridge) on some setups.
+- **Wait for carrier:** after `ip link down/up`, link sense can lag; activating too early produces transient “no carrier” errors even when the link recovers moments later.
+- **No `nmcli -f …,connection.interface-name` on bulk `connection show`:** that field list is invalid for a single tabular query; saved profiles are inspected per-UUID with `nmcli -g`.
 
 ## Limitations
 
